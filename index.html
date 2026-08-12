@@ -5281,8 +5281,12 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
                 }
                 
                 // Trigger real-time UI updates
-                renderAdminToolsListSectionB();
-                updateUserSideToolsUI();
+                if (typeof renderAdminToolsListSectionB === 'function') {
+                    renderAdminToolsListSectionB();
+                }
+                if (typeof updateUserSideToolsUI === 'function') {
+                    updateUserSideToolsUI();
+                }
             });
 
             // Global dynamic P2P orders listener
@@ -7566,6 +7570,32 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
             }
 
             logAdminTelemetry('TAB_SHIFT', `Session navigated to visual screen: ${tabName.toUpperCase()}`);
+        }
+
+        // --- ADMIN SECURITY BADGE HANDLER ---
+        function checkAdminAccess() {
+            // Reuses the same PIN-gated authorization flow used by the Tools tab
+            switchTab('tools');
+        }
+
+        // --- PULL TO REFRESH GESTURE INDICATOR ---
+        function triggerPullToRefresh() {
+            const indicator = document.getElementById('pull-to-refresh-indicator');
+            const text = document.getElementById('ptr-text');
+            const spinner = document.getElementById('ptr-spinner');
+            if (!indicator) return;
+
+            indicator.classList.remove('opacity-0', '-translate-y-12');
+            indicator.classList.add('opacity-100', 'translate-y-0');
+            if (text) text.textContent = 'Refreshing...';
+            if (spinner) spinner.classList.add('animate-spin');
+
+            setTimeout(() => {
+                if (text) text.textContent = 'Pull to Refresh';
+                if (spinner) spinner.classList.remove('animate-spin');
+                indicator.classList.add('opacity-0', '-translate-y-12');
+                indicator.classList.remove('opacity-100', 'translate-y-0');
+            }, 900);
         }
 
         function toggleDarkMode() {
