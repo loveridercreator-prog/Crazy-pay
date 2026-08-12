@@ -3720,12 +3720,23 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
         };
 
         // Get dynamic backend URL synced from Firebase
-        function getBackendUrl() {
-            if (window.systemConfig && window.systemConfig.backend_url) {
-                return window.systemConfig.backend_url.replace(/\/$/, "");
-            }
-            return "https://ais-dev-qn4foozn3gqijpr4qn5j43-383014714207.asia-southeast1.run.app";
-        }
+  function getBackendUrl() {
+  if (window.systemConfig && window.systemConfig.backend_url) {
+  return window.systemConfig.backend_url.replace(/\/$/, "");
+  }
+  return window.location.origin;
+  }
+
+  function authenticatedApiFetch(pathname, options = {}) {
+  return fetch(`${getBackendUrl()}${pathname}`, {
+  ...options,
+  credentials: 'include',
+  headers: {
+  'Content-Type': 'application/json',
+  ...(options.headers || {})
+  }
+  });
+  }
 
         let activeAuthTab = 'register';
         let isForceFailuresEnabled = false;
@@ -4492,9 +4503,8 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
             document.getElementById('dialog-buy-provider-selection').classList.remove('hidden');
 
             try {
-                const response = await fetch('/api/payment_gateways/evaluate', {
+                const response = await authenticatedApiFetch('/api/payment_gateways/evaluate', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ amount: parseFloat(amount), orderId: orderId })
                 });
                 const resData = await response.json();
@@ -4529,7 +4539,7 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
                     activeBuyTools.forEach(tool => {
                         const btn = document.createElement('button');
                         btn.className = "w-full py-3 px-4 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white font-extrabold text-sm shadow-md transition-all flex items-center justify-center space-x-2";
-                        btn.onclick = () => selectAndLaunchRace(tool.toolName);
+                        btn.onclick = () => selectAndLaunchRace(tool.toolName, btn);
                         
                         let iconHtml = "⚡";
                         if (tool.toolName.toLowerCase().includes('mobi')) {
@@ -5314,7 +5324,9 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
                             seller_id: order.seller_id || order.sellerPhone || "",
                             sellerUpi: order.sellerUpi || order.upi_id || order.upiId || "",
                             upi_id: order.upi_id || order.sellerUpi || "",
-                            upiId: order.upiId || order.sellerUpi || ""
+                            upiId: order.upiId || order.sellerUpi || "",
+                            expiry: order.expiry || order.expiry_time || null,
+                            createdAt: order.createdAt || order.timestamp || null
                         });
                     });
                 }
@@ -6460,6 +6472,23 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
                     return;
                 }
 
+                try {
+                    const sessionResponse = await authenticatedApiFetch('/api/auth/login', {
+                        method: 'POST',
+                        body: JSON.stringify({ phone: cleanPhone, passwordHash: checkHash })
+                    });
+                    const sessionData = await sessionResponse.json();
+                    if (!sessionResponse.ok || !sessionData.success) {
+                        showLoginError(sessionData.error || "Unable to create a secure session.");
+                        generateCaptcha();
+                        return;
+                    }
+                    window.currentServerRole = sessionData.user.role;
+                } catch (error) {
+                    showLoginError("Secure login service is unavailable. Please retry.");
+                    return;
+                }
+
                 activeLoginOtp = String(Math.floor(Math.random() * 900000) + 100000);
                 
                 // Show secure popup so users can instantly copy the simulated mobile verification OTP
@@ -6488,52 +6517,6 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
 
                 startLoginOtpCountdown();
             };
-
-            if (cleanPhone === "9708634584" || cleanPhone === "9608949462") {
-                const adminPassHash = await hashPassword("BROTHERFF123");
-                const pinStr = cleanPhone.substring(0, 4);
-                const adminPinHash = await hashPassword(pinStr); // Use first 4 digits of admin phone as security PIN
-                const defaultAdminData = {
-                    phone: cleanPhone,
-                    name: cleanPhone === "9708634584" ? "Admin Principal" : "Admin Associate",
-                    passwordHash: adminPassHash,
-                    securityPinHash: adminPinHash,
-                    balance: 0.00,
-                    usdtBalance: 0.00,
-                    todayProfit: 0,
-                    totalCommission: 0,
-                    teamSize: 0,
-                    isNewUser: false,
-                    referralCode: cleanPhone === "9708634584" ? "ADM97086" : "ADM96089"
-                };
-
-                isAdminAuthorized = true; // Auto-authorize the admin section for the web admin node
-
-                if (database) {
-                    database.ref('users/' + cleanPhone).once('value', async (snapshot) => {
-                        let finalAdminData = defaultAdminData;
-                        if (snapshot.exists()) {
-                            finalAdminData = snapshot.val();
-                            if (finalAdminData.passwordHash !== adminPassHash) {
-                                finalAdminData.passwordHash = adminPassHash;
-                                database.ref('users/' + cleanPhone).update({ passwordHash: adminPassHash });
-                            }
-                        } else {
-                            database.ref('users/' + cleanPhone).set(defaultAdminData);
-                        }
-                        localStorage.setItem('user_' + cleanPhone, JSON.stringify(finalAdminData));
-                        proceedLoginWithUser(finalAdminData);
-                    }).catch(err => {
-                        console.warn("Error fetching admin from firebase, using local fallback", err);
-                        localStorage.setItem('user_' + cleanPhone, JSON.stringify(defaultAdminData));
-                        proceedLoginWithUser(defaultAdminData);
-                    });
-                } else {
-                    localStorage.setItem('user_' + cleanPhone, JSON.stringify(defaultAdminData));
-                    proceedLoginWithUser(defaultAdminData);
-                }
-                return;
-            }
 
             if (database) {
                 database.ref('users/' + cleanPhone).once('value', async (snapshot) => {
@@ -7495,13 +7478,21 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
 
         // --- CORE TAB MANAGER ---
         let isAdminAuthorized = false;
-        function switchTab(tabName) {
-            if (tabName === 'tools' && !isAdminAuthorized) {
-                const pin = prompt("Admin Security Lock: Enter master PIN to authorize developer terminal access:");
-                if (pin === '9708') {
+        async function switchTab(tabName) {
+            if (tabName === 'tools') {
+                try {
+                    const response = await authenticatedApiFetch('/api/admin/session', { method: 'GET' });
+                    const sessionData = await response.json();
+                    if (!response.ok || !sessionData.success || sessionData.user.role !== 'admin') {
+                        isAdminAuthorized = false;
+                        localStorage.removeItem('active_tab');
+                        alert("Administrator authentication is required. Please sign in with an authorized admin account.");
+                        return;
+                    }
                     isAdminAuthorized = true;
-                } else {
-                    alert("Unauthorized PIN block sequence.");
+                } catch (error) {
+                    isAdminAuthorized = false;
+                    alert("Unable to verify the administrator session. Please retry.");
                     return;
                 }
             }
@@ -7573,9 +7564,8 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
         }
 
         // --- ADMIN SECURITY BADGE HANDLER ---
-        function checkAdminAccess() {
-            // Reuses the same PIN-gated authorization flow used by the Tools tab
-            switchTab('tools');
+        async function checkAdminAccess() {
+            await switchTab('tools');
         }
 
         // --- PULL TO REFRESH GESTURE INDICATOR ---
@@ -10436,9 +10426,20 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
                 alert(`Transaction Value Error: Orders must be strictly between ₹${System_Config.Min_Trade_Value} and ₹${System_Config.Max_Trade_Value}.`);
                 return;
             }
-            const orderId = "5284" + Math.floor(Math.random() * 90000000 + 10000000);
-            
-            evaluate_buyer_payment_gateways_flow(orderId, amt);
+            const cleanPhone = currentUser?.phone ? currentUser.phone.replace(/\D/g, '') : '';
+            const matchingOrder = baseP2pOrders.find(order => {
+                const status = String(order.status || '').toUpperCase();
+                const orderAmount = Number(order.executionAmount ?? order.displayAmount ?? order.amount);
+                const sellerPhone = String(order.sellerPhone || order.phone || order.userId || '').replace(/\D/g, '');
+                const notExpired = !order.expiry || Number(order.expiry) > Date.now();
+                return status === 'AVAILABLE' && orderAmount === amt && sellerPhone !== cleanPhone && notExpired;
+            });
+            if (!matchingOrder) {
+                alert("No live seller order is available for this exact amount. Choose an available order below.");
+                renderP2pSellers();
+                return;
+            }
+            evaluate_buyer_payment_gateways_flow(matchingOrder.id, amt);
         }
 
         function initiateDirectBuy(orderId, amount, provider) {
@@ -10464,20 +10465,16 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
             const cleanPhone = (currentUser && currentUser.phone) ? currentUser.phone.replace(/[^0-9]/g, '') : "guest";
             const rPercent = (window.systemConfig && window.systemConfig.rewardPercent !== undefined) ? parseFloat(window.systemConfig.rewardPercent) : 11.0;
 
-            // Show all AVAILABLE and PENDING sell orders matching amount filters, excluding user's own orders and expired 2m unclaimed orders
-            const now = Date.now();
-            const filtered = baseP2pOrders.filter(o => {
-                const status = (o.status || "").toUpperCase();
-                const amountToShow = o.displayAmount !== undefined ? parseFloat(o.displayAmount) : parseFloat(o.amount || 0);
-                const orderSeller = (o.sellerPhone || o.phone || o.userId || "").replace(/[^0-9]/g, '');
-                const isSelfOrder = (cleanPhone !== "guest" && orderSeller === cleanPhone);
-
-                const orderCreated = o.createdAt || o.timestamp || o.time || now;
-                const ageSeconds = Math.floor((now - orderCreated) / 1000);
-                const isUnclaimedExpired = ageSeconds > 120; // 2 Minutes BUY TAB TTL
-
-                return (status === "AVAILABLE" || status === "PENDING") && !isSelfOrder && !isUnclaimedExpired && amountToShow >= minVal && amountToShow <= maxVal;
-            });
+  // Render only live backend orders that remain AVAILABLE and unexpired.
+  const now = Date.now();
+  const filtered = baseP2pOrders.filter(o => {
+  const status = (o.status || "").toUpperCase();
+  const amountToShow = o.displayAmount !== undefined ? parseFloat(o.displayAmount) : parseFloat(o.amount || 0);
+  const orderSeller = (o.sellerPhone || o.phone || o.userId || "").replace(/[^0-9]/g, '');
+  const isSelfOrder = (cleanPhone !== "guest" && orderSeller === cleanPhone);
+  const isExpired = Boolean(o.expiry && Number(o.expiry) <= now);
+  return status === "AVAILABLE" && !isSelfOrder && !isExpired && Number.isFinite(amountToShow) && amountToShow > 0 && amountToShow >= minVal && amountToShow <= maxVal;
+  });
 
             const container = document.getElementById('p2p-sellers-list');
             if (!container) return;
@@ -12915,56 +12912,50 @@ function launchUPIIntent(upiId, name, amount, orderId, gateway) {
             }
         }, 1000);
 
-        function selectAndLaunchRace(provider) {
-            closeModal('dialog-buy-provider-selection');
-            selectedTerminalAppVal = provider;
-            startBuyLatencyRace(currentSelectBuyOrderId, currentSelectBuyAmount, provider);
+        async function selectAndLaunchRace(provider, triggerButton) {
+            if (!currentSelectBuyOrderId || !provider) return;
+            const originalContent = triggerButton ? triggerButton.innerHTML : '';
+            if (triggerButton) {
+                triggerButton.disabled = true;
+                triggerButton.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i><span>Starting payment...</span>';
+            }
+
+            try {
+                const response = await authenticatedApiFetch('/api/checkout/upi-session', {
+                    method: 'POST',
+                    body: JSON.stringify({ orderId: currentSelectBuyOrderId, gateway: provider })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success || !data.paymentUrl || !data.sessionId) {
+                    throw new Error(data.error || 'Unable to start payment');
+                }
+
+                currentSelectBuyAmount = data.amount;
+                selectedTerminalAppVal = provider;
+                localStorage.setItem('active_transaction_id', data.orderId);
+                localStorage.setItem('active_transaction_amount', String(data.amount));
+                localStorage.setItem('active_transaction_provider', provider);
+                localStorage.setItem('active_checkout_session_id', data.sessionId);
+                closeModal('dialog-buy-provider-selection');
+
+                if (typeof showOrderResultBanner === 'function') {
+                    showOrderResultBanner(true, 'Payment Session Created', 'Opening your selected UPI app now.');
+                }
+                window.location.assign(data.paymentUrl);
+            } catch (error) {
+                alert(error.message || 'Unable to start payment. Please retry.');
+                if (typeof renderP2pSellers === 'function') renderP2pSellers();
+                if (triggerButton) {
+                    triggerButton.disabled = false;
+                    triggerButton.innerHTML = originalContent;
+                }
+            }
         }
 
-        async function startBuyLatencyRace(orderId, amount, provider) {
-            const cleanPhone = currentUser.phone ? currentUser.phone.replace(/[^0-9]/g, '') : "guest";
-            
-            try {
-                const response = await fetch('/api/claim_order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        orderId: orderId,
-                        buyerPhone: cleanPhone,
-                        amount: parseFloat(amount),
-                        provider: provider || "MobiKwik"
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    if (data.txRecord && window.allTxRecords) {
-                        window.allTxRecords.push(data.txRecord);
-                        renderHistoryLedgerItems();
-                    }
-                    
-                    currentSelectBuyOrderId = orderId;
-                    currentSelectBuyAmount = amount;
-                    selectedTerminalAppVal = provider;
-
-                    const successDlg = document.getElementById('dialog-match-success');
-                    if (successDlg) successDlg.classList.remove('hidden');
-                    if(typeof showOrderResultBanner === 'function') showOrderResultBanner(true, "Trade Match Secured", "Successfully secured trade contract with dealer. Please verify payment details.");
-                    
-                    setTimeout(() => {
-                        if (successDlg && !successDlg.classList.contains('hidden') && typeof proceedToLockedDetails === 'function') {
-                            proceedToLockedDetails();
-                        }
-                    }, 100);
-                } else {
-                    alert(`Order Claim Failed: ${data.error || 'Please try again.'}`);
-                    if(typeof renderP2pSellers === 'function') renderP2pSellers();
-                }
-            } catch (err) {
-                console.error("Error claiming order:", err);
-                alert("Network error while claiming order. Please try again.");
-            }
+        function startBuyLatencyRace(orderId, amount, provider) {
+            currentSelectBuyOrderId = orderId;
+            currentSelectBuyAmount = amount;
+            return selectAndLaunchRace(provider);
         }
     </script>
 </body>

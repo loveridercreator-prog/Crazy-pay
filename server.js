@@ -2,7 +2,79 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
+
+const ADMIN_PHONES = new Set(['9708634584', '9608949462']);
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SUPPORTED_UPI_APPS = new Set(['phonepe', 'googlepay', 'gpay', 'paytm', 'mobikwik', 'freecharge', 'supermoney', 'upi']);
+
+function normalizePhone(value) {
+    return String(value || '').replace(/\D/g, '').slice(-10);
+}
+
+function sha256(value) {
+    return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function parseCookies(req) {
+    return String(req.headers.cookie || '').split(';').reduce((cookies, item) => {
+        const index = item.indexOf('=');
+        if (index > 0) cookies[item.slice(0, index).trim()] = decodeURIComponent(item.slice(index + 1).trim());
+        return cookies;
+    }, {});
+}
+
+function signSession(payload) {
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+    return `${encoded}.${signature}`;
+}
+
+function verifySession(req) {
+    const token = parseCookies(req).crazy_pay_session;
+    if (!token) return null;
+    const [encoded, signature] = token.split('.');
+    if (!encoded || !signature) return null;
+    const expected = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+    try {
+        const session = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+        if (!session.phone || !session.expiresAt || session.expiresAt <= Date.now()) return null;
+        return session;
+    } catch {
+        return null;
+    }
+}
+
+function readJsonBody(req, maxBytes = 16_384) {
+    return new Promise((resolve, reject) => {
+        let body = '';
+        req.on('data', chunk => {
+            body += chunk;
+            if (body.length > maxBytes) reject(new Error('Request body too large'));
+        });
+        req.on('end', () => {
+            try { resolve(JSON.parse(body || '{}')); } catch { reject(new Error('Invalid JSON body')); }
+        });
+        req.on('error', reject);
+    });
+}
+
+function sendJson(res, statusCode, body, headers = {}) {
+    res.writeHead(statusCode, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
+    res.end(JSON.stringify(body));
+}
+
+function requireAdmin(req, res) {
+    const session = verifySession(req);
+    if (!session || session.role !== 'admin' || !ADMIN_PHONES.has(session.phone)) {
+        sendJson(res, 403, { success: false, code: 'ADMIN_REQUIRED', error: 'Administrator session required' });
+        return null;
+    }
+    return session;
+}
 
 const { handleCreateOrder, handleToggleStatus } = require('./orderController');
 const { handleUtrVerification, handleUsdtStatusCheck, handleBankIngestion, handleScreenshotForensics } = require('./utrController');
@@ -104,7 +176,9 @@ setInterval(async () => {
             if (o.status === "IN TRANSACTION" || o.status === "PAYING" || o.status === "PENDING_VERIFICATION") {
                 const expiryTime = o.expiry || o.expiry_time || (o.claimedAt ? o.claimedAt + 600000 : 0);
                 if (expiryTime && now > expiryTime) {
-                    // Order has expired. Reset it to AVAILABLE.
+                    // Order has expired. Reset it to AVAILABLE and release the persisted checkout.
+                    const expiredBuyerPhone = normalizePhone(o.buyerPhone);
+                    const expiredCheckoutSessionId = o.checkoutSessionId || null;
                     o.status = "AVAILABLE";
                     o.buyerPhone = null;
                     o.buyerUserId = null;
@@ -115,10 +189,15 @@ setInterval(async () => {
                     await firebaseRequest(`p2p_orders/${orderId}`, 'PUT', o);
                     expiredCount++;
                     
-                    // Also clean up user's active_buy if it exists (best-effort)
-                    if (o.buyerPhone) {
-                        const cleanPhone = o.buyerPhone.replace(/[^0-9]/g, '');
-                        await firebaseRequest(`users/${cleanPhone}/active_buy`, 'DELETE');
+                    // Also clean up the buyer and checkout records (best-effort).
+                    if (expiredBuyerPhone) {
+                        await firebaseRequest(`users/${expiredBuyerPhone}/active_buy`, 'DELETE');
+                    }
+                    if (expiredCheckoutSessionId) {
+                        await firebaseRequest(`checkout_sessions/${expiredCheckoutSessionId}`, 'PATCH', {
+                            status: 'EXPIRED',
+                            expiredAt: now
+                        });
                     }
                 }
             }
@@ -132,8 +211,12 @@ setInterval(async () => {
 }, 60000); // Check every 60 seconds
 
 const server = http.createServer((req, res) => {
-    // Inject robust CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // Credentialed CORS must echo the concrete requesting origin, never "*".
+    const requestOrigin = req.headers.origin;
+    if (requestOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+        res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
     res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With, content-type, Authorization, Device-ID, User-Agent');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -151,6 +234,43 @@ const server = http.createServer((req, res) => {
     // Basic routing
     let urlPath = req.url.split('?')[0];
     const parsedUrl = require('url').parse(req.url);
+
+    if (req.method === 'POST' && urlPath === '/api/auth/login') {
+        readJsonBody(req).then(async ({ phone, passwordHash }) => {
+            const cleanPhone = normalizePhone(phone);
+            if (!/^\d{10}$/.test(cleanPhone) || !/^[a-f0-9]{64}$/i.test(String(passwordHash || ''))) {
+                return sendJson(res, 400, { success: false, error: 'Valid phone and password are required' });
+            }
+            const user = await firebaseRequest(`users/${cleanPhone}`, 'GET');
+            if (!user || !user.passwordHash || user.passwordHash !== String(passwordHash).toLowerCase()) {
+                return sendJson(res, 401, { success: false, error: 'Invalid phone or password' });
+            }
+            const role = ADMIN_PHONES.has(cleanPhone) ? 'admin' : 'user';
+            const expiresAt = Date.now() + SESSION_TTL_MS;
+            const token = signSession({ phone: cleanPhone, role, expiresAt });
+            const forwardedProto = req.headers['x-forwarded-proto'];
+            const secure = forwardedProto === 'https' || Boolean(req.socket.encrypted);
+            const cookie = `crazy_pay_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=${secure ? 'None' : 'Lax'}${secure ? '; Secure' : ''}`;
+            return sendJson(res, 200, { success: true, user: { phone: cleanPhone, role }, expiresAt }, { 'Set-Cookie': cookie });
+        }).catch(error => sendJson(res, 400, { success: false, error: error.message }));
+        return;
+    }
+
+    if (req.method === 'GET' && urlPath === '/api/auth/session') {
+        const session = verifySession(req);
+        if (!session) return sendJson(res, 401, { success: false, authenticated: false });
+        return sendJson(res, 200, { success: true, authenticated: true, user: { phone: session.phone, role: session.role }, expiresAt: session.expiresAt });
+    }
+
+    if (req.method === 'POST' && urlPath === '/api/auth/logout') {
+        return sendJson(res, 200, { success: true }, { 'Set-Cookie': 'crazy_pay_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax' });
+    }
+
+    if (req.method === 'GET' && urlPath === '/api/admin/session') {
+        const session = requireAdmin(req, res);
+        if (!session) return;
+        return sendJson(res, 200, { success: true, user: { phone: session.phone, role: session.role } });
+    }
 
     // Order Creation Endpoint with Strict Amount Binding
     if (req.method === 'POST' && (urlPath === '/api/order/create' || urlPath === '/api/create_order' || urlPath === '/api/create_p2p_order')) {
@@ -563,6 +683,103 @@ const server = http.createServer((req, res) => {
 // High-concurrency atomic locking store for order claims (SELECT FOR UPDATE microsecond lock)
 const atomicOrderLocks = new Set();
 
+    // Canonical authenticated UPI checkout-session endpoint.
+    if (req.method === 'POST' && urlPath === '/api/checkout/upi-session') {
+        const session = verifySession(req);
+        if (!session) {
+            sendJson(res, 401, { success: false, code: 'AUTH_REQUIRED', error: 'Please sign in again before paying' });
+            return;
+        }
+
+        readJsonBody(req).then(async ({ orderId, gateway, provider }) => {
+            const cleanOrderId = String(orderId || '').trim();
+            const selectedGateway = String(gateway || provider || '').trim();
+            const normalizedGateway = selectedGateway.toLowerCase().replace(/[^a-z]/g, '');
+            if (!/^[A-Za-z0-9_-]{4,80}$/.test(cleanOrderId) || !SUPPORTED_UPI_APPS.has(normalizedGateway)) {
+                return sendJson(res, 400, { success: false, code: 'INVALID_CHECKOUT', error: 'A valid order and supported UPI app are required' });
+            }
+            if (atomicOrderLocks.has(cleanOrderId)) {
+                return sendJson(res, 409, { success: false, code: 'ORDER_ALREADY_PICKED', error: 'This order is already being paid' });
+            }
+
+            atomicOrderLocks.add(cleanOrderId);
+            let claimed = false;
+            try {
+                const order = await firebaseRequest(`p2p_orders/${cleanOrderId}`, 'GET');
+                const orderStatus = String(order?.status || '').toUpperCase();
+                if (!order || !['AVAILABLE', 'PENDING'].includes(orderStatus)) {
+                    return sendJson(res, 409, { success: false, code: 'ORDER_UNAVAILABLE', error: 'This order is no longer available' });
+                }
+
+                const amount = Number(order.executionAmount ?? order.displayAmount ?? order.amount);
+                const sellerPhone = normalizePhone(order.sellerPhone || order.phone || order.userId);
+                const sellerUpi = String(order.upi_id || order.sellerUpi || order.upiId || order.targetUpiId || '').trim();
+                const sellerName = String(order.sellerName || order.name || 'CRAZY PAY MERCHANT').trim();
+                if (!Number.isFinite(amount) || amount <= 0 || !/^[\w.-]{2,}@[\w.-]{2,}$/.test(sellerUpi)) {
+                    return sendJson(res, 422, { success: false, code: 'INVALID_ORDER_DATA', error: 'Seller payment details are incomplete' });
+                }
+                if (sellerPhone && sellerPhone === session.phone) {
+                    return sendJson(res, 409, { success: false, code: 'SELF_PURCHASE', error: 'You cannot buy your own order' });
+                }
+
+                const now = Date.now();
+                const expiresAt = now + 10 * 60 * 1000;
+                const sessionId = `upi_${now}_${crypto.randomBytes(8).toString('hex')}`;
+                const { generateUpiIntentUri } = require('./backendUriGenerator.js');
+                const paymentUrl = generateUpiIntentUri(selectedGateway, sellerUpi, sellerName, amount, cleanOrderId);
+                const checkout = {
+                    sessionId,
+                    orderId: cleanOrderId,
+                    buyerPhone: session.phone,
+                    sellerPhone,
+                    amount,
+                    gateway: selectedGateway,
+                    status: 'PENDING_PAYMENT',
+                    createdAt: now,
+                    expiresAt
+                };
+
+                await firebaseRequest(`p2p_orders/${cleanOrderId}`, 'PATCH', {
+                    status: 'IN TRANSACTION',
+                    buyerPhone: session.phone,
+                    checkoutSessionId: sessionId,
+                    claimedAt: now,
+                    expiry: expiresAt,
+                    expiry_time: expiresAt
+                });
+                claimed = true;
+                try {
+                    await firebaseRequest(`checkout_sessions/${sessionId}`, 'PUT', checkout);
+                    await firebaseRequest(`users/${session.phone}/active_buy`, 'PUT', checkout);
+                    await firebaseRequest(`users/${session.phone}/transactions/tx_${cleanOrderId}`, 'PUT', {
+                        id: cleanOrderId,
+                        sessionId,
+                        type: 'Buy Order Lock',
+                        amount,
+                        status: 'PENDING_PAYMENT',
+                        provider: selectedGateway,
+                        timestamp: now
+                    });
+                } catch (writeError) {
+                    await firebaseRequest(`p2p_orders/${cleanOrderId}`, 'PATCH', {
+                        status: 'AVAILABLE', buyerPhone: null, checkoutSessionId: null, claimedAt: null, expiry: null, expiry_time: null
+                    }).catch(() => {});
+                    claimed = false;
+                    throw writeError;
+                }
+
+                setTimeout(() => atomicOrderLocks.delete(cleanOrderId), 10 * 60 * 1000);
+                return sendJson(res, 201, { success: true, sessionId, orderId: cleanOrderId, status: checkout.status, paymentUrl, amount, expiresAt });
+            } finally {
+                if (!claimed) atomicOrderLocks.delete(cleanOrderId);
+            }
+        }).catch(error => {
+            console.error('[UPI Checkout] Session creation failed:', error);
+            if (!res.headersSent) sendJson(res, 500, { success: false, code: 'CHECKOUT_FAILED', error: 'Unable to start payment. Please retry.' });
+        });
+        return;
+    }
+
     // High-concurrency atomic claim endpoint
     if (req.method === 'POST' && urlPath === '/api/claim_order') {
         let body = '';
@@ -957,8 +1174,9 @@ const atomicOrderLocks = new Set();
     // Integrated UTR Engine Pipeline Status & Health Check Endpoint
     
     
-    if (req.method === 'POST' && urlPath === '/api/v1/admin/toggle-withdrawal-engine') {
-        let body = '';
+if (req.method === 'POST' && urlPath === '/api/v1/admin/toggle-withdrawal-engine') {
+  if (!requireAdmin(req, res)) return;
+  let body = '';
         req.on('data', chunk => body += chunk.toString());
         req.on('end', async () => {
             try {
